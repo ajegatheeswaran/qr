@@ -1,5 +1,5 @@
-import React, { useState, useEffect } from 'react';
-import { Text, View, StyleSheet, Button, Alert, ActivityIndicator, Platform } from 'react-native';
+import React, { useState, useEffect, useRef } from 'react';
+import { Text, View, StyleSheet, Button, Alert, ActivityIndicator, Platform, TouchableOpacity, Image } from 'react-native';
 import { CameraView, useCameraPermissions } from 'expo-camera';
 import { API_BASE_URL } from './config';
 
@@ -9,7 +9,13 @@ export default function QRScanner() {
   const [scannedData, setScannedData] = useState(null);
   const [verifying, setVerifying] = useState(false);
   const [patientInfo, setPatientInfo] = useState(null);
+  const [authToken, setAuthToken] = useState(null); // Store JWT token for API calls
   const [lastScanTime, setLastScanTime] = useState(0);
+  const [confirmed, setConfirmed] = useState(false);
+  const [mode, setMode] = useState('qr'); // 'qr', 'photo', 'medication'
+  const [capturedPhoto, setCapturedPhoto] = useState(null);
+  const [uploading, setUploading] = useState(false);
+  const cameraRef = useRef(null);
 
   useEffect(() => {
     if (permission && !permission.granted) {
@@ -40,20 +46,9 @@ export default function QRScanner() {
       if (result.success) {
         const { patientData, generatedAt, expiresAt } = result.data;
         setPatientInfo(patientData);
-        
-        Alert.alert(
-          '✅ Valid Patient QR Code',
-          `Name: ${patientData.fullName}\nDOB: ${patientData.dob}\nGender: ${patientData.gender}\n\nGenerated: ${new Date(generatedAt).toLocaleString()}\nExpires: ${new Date(expiresAt).toLocaleString()}`,
-          [
-            {
-              text: 'OK',
-              onPress: () => {
-                setScanned(false);
-                setPatientInfo(null);
-              }
-            }
-          ]
-        );
+        setAuthToken(token); // Store the ORIGINAL scanned token for API calls
+        setScanned(true);
+        // Don't auto-dismiss, show confirmation UI
       } else {
         let errorMessage = result.message || 'Failed to verify QR code';
         
@@ -99,13 +94,36 @@ export default function QRScanner() {
   };
 
   const handleBarCodeScanned = ({ type, data }) => {
-    // Only process QR codes (ignore other barcode types)
-    if (type !== 'qr' && type !== 256) { // 256 is QR code type number
+    // Handle medication barcode scanning
+    if (mode === 'medication') {
+      console.log('Medication barcode scanned:', { type, data });
+      
+      Alert.alert(
+        '💊 Medication Scanned',
+        `Barcode Type: ${type}\nData: ${data}\n\nLink this medication to ${patientInfo?.fullName}?`,
+        [
+          {
+            text: 'Cancel',
+            style: 'cancel',
+            onPress: () => setMode('qr')
+          },
+          {
+            text: 'Add Medication',
+            onPress: async () => {
+              await addMedicationToPatient(data, type);
+            }
+          }
+        ]
+      );
+      return;
+    }
+
+    // Only process QR codes for patient verification
+    if (type !== 'qr' && type !== 256) {
       return;
     }
     
     // Validate that the scanned data looks like a JWT token
-    // JWT tokens have 3 parts separated by dots
     const jwtPattern = /^[A-Za-z0-9-_]+\.[A-Za-z0-9-_]+\.[A-Za-z0-9-_]+$/;
     if (!jwtPattern.test(data)) {
       console.log('Scanned data is not a valid JWT token, ignoring');
@@ -126,6 +144,162 @@ export default function QRScanner() {
     
     // Verify the JWT token with backend
     verifyQRToken(data);
+  };
+
+  const addMedicationToPatient = async (barcodeData, barcodeType) => {
+    try {
+      setUploading(true);
+      
+      console.log('Adding medication to patient:', {
+        patientId: patientInfo.id,
+        barcode: barcodeData,
+        type: barcodeType
+      });
+      
+      // TODO: Integrate with existing medication history system
+      // Need to map barcode to medication_history_types table
+      
+      setUploading(false);
+      
+      Alert.alert(
+        '✅ Success',
+        `Medication barcode scanned for ${patientInfo.fullName}!\n\nBarcode: ${barcodeData}\nType: ${barcodeType}\n\n(Integration with medication history pending)`,
+        [
+          {
+            text: 'Scan Another',
+            onPress: () => {} // Stay in medication mode
+          },
+          {
+            text: 'Done',
+            onPress: () => resetScanner()
+          }
+        ]
+      );
+    } catch (error) {
+      setUploading(false);
+      console.error('Add medication error:', error);
+      Alert.alert('Error', 'Failed to add medication: ' + error.message);
+    }
+  };
+
+  const handleConfirmPatient = () => {
+    setConfirmed(true);
+  };
+
+  const handleTakePhoto = async () => {
+    setMode('photo');
+  };
+
+  const capturePhoto = async () => {
+    if (cameraRef.current) {
+      try {
+        setUploading(true);
+        const photo = await cameraRef.current.takePictureAsync({
+          quality: 0.8,
+          base64: false, // We'll use URI for FormData
+        });
+        
+        console.log('Photo captured:', photo.uri);
+        setCapturedPhoto(photo);
+        
+        // Upload photo to backend
+        await uploadPhotoToBackend(photo);
+        
+      } catch (error) {
+        console.error('Photo capture error:', error);
+        Alert.alert('Error', 'Failed to capture photo: ' + error.message);
+        setUploading(false);
+      }
+    }
+  };
+
+  const uploadPhotoToBackend = async (photo) => {
+    try {
+      const formData = new FormData();
+      
+      // Get current date in DD/MM/YYYY format
+      const now = new Date();
+      const dateImage = `${String(now.getDate()).padStart(2, '0')}/${String(now.getMonth() + 1).padStart(2, '0')}/${now.getFullYear()}`;
+      
+      // Append photo file
+      formData.append('image', {
+        uri: photo.uri,
+        type: 'image/jpeg',
+        name: `patient_${patientInfo.id}_${Date.now()}.jpg`,
+      });
+      
+      formData.append('patientId', patientInfo.id);
+      formData.append('woundId', patientInfo.woundId || ''); // Optional wound ID
+      formData.append('imageTypeOfWound', 'QR_SCAN'); // Type identifier
+      formData.append('dateImage', dateImage);
+      
+      console.log('Uploading photo to:', `${API_BASE_URL}/photo/send-photo-qr`);
+      
+      const response = await fetch(`${API_BASE_URL}/photo/send-photo-qr`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${authToken}`,
+        },
+        body: formData,
+      });
+      
+      const result = await response.json();
+      
+      setUploading(false);
+      
+      if (result.message === 'Success photo data saved' || response.ok) {
+        Alert.alert(
+          '✅ Success',
+          `Photo uploaded successfully for ${patientInfo.fullName}!`,
+          [
+            {
+              text: 'Take Another',
+              onPress: () => setCapturedPhoto(null)
+            },
+            {
+              text: 'Done',
+              onPress: () => resetScanner()
+            }
+          ]
+        );
+      } else {
+        throw new Error(result.message || 'Upload failed');
+      }
+    } catch (error) {
+      setUploading(false);
+      console.error('Upload error:', error);
+      Alert.alert(
+        'Upload Failed',
+        `Failed to upload photo: ${error.message}\n\nPlease try again.`,
+        [
+          {
+            text: 'Retry',
+            onPress: () => uploadPhotoToBackend(photo)
+          },
+          {
+            text: 'Cancel',
+            onPress: () => {
+              setCapturedPhoto(null);
+              setMode('qr');
+            }
+          }
+        ]
+      );
+    }
+  };
+
+  const handleScanMedication = () => {
+    setMode('medication');
+  };
+
+  const resetScanner = () => {
+    setScanned(false);
+    setPatientInfo(null);
+    setAuthToken(null);
+    setConfirmed(false);
+    setMode('qr');
+    setCapturedPhoto(null);
+    setUploading(false);
   };
 
   if (!permission) {
@@ -150,21 +324,39 @@ export default function QRScanner() {
 
   return (
     <View style={styles.container}>
-      <CameraView
-        facing="back"
-        onBarcodeScanned={scanned ? undefined : handleBarCodeScanned}
-        barcodeScannerSettings={{
-          barcodeTypes: ['qr', 'pdf417'],
-        }}
-        style={StyleSheet.absoluteFillObject}
-      />
+      {/* Only show camera when appropriate */}
+      {(!scanned || mode === 'photo' || mode === 'medication') && !capturedPhoto && (
+        <CameraView
+          ref={cameraRef}
+          facing="back"
+          onBarcodeScanned={mode === 'photo' ? undefined : (mode === 'medication' ? handleBarCodeScanned : ((scanned && confirmed) ? undefined : handleBarCodeScanned))}
+          barcodeScannerSettings={{
+            barcodeTypes: mode === 'medication' ? ['qr', 'ean13', 'ean8', 'code128', 'code39'] : ['qr'],
+          }}
+          style={StyleSheet.absoluteFillObject}
+        />
+      )}
+      
+      {/* Show captured photo preview */}
+      {capturedPhoto && (
+        <Image source={{ uri: capturedPhoto.uri }} style={StyleSheet.absoluteFillObject} />
+      )}
+      
       <View style={styles.header}>
-        <Text style={styles.title}>Patient QR Code Scanner</Text>
-        <Text style={styles.subtitle}>Secure JWT Verification</Text>
+        <Text style={styles.title}>
+          {mode === 'photo' ? '📷 Take Photo' : mode === 'medication' ? '💊 Scan Medication' : '🔍 Patient QR Scanner'}
+        </Text>
+        <Text style={styles.subtitle}>
+          {mode === 'photo' ? 'Capture patient photo' : mode === 'medication' ? 'Scan medication barcode' : 'Secure JWT Verification'}
+        </Text>
       </View>
-      <View style={styles.overlay}>
-        <View style={styles.scanArea} />
-      </View>
+      
+      {/* Only show scan area when actively scanning */}
+      {(!scanned || mode === 'medication') && !capturedPhoto && (
+        <View style={styles.overlay}>
+          <View style={styles.scanArea} />
+        </View>
+      )}
       
       {verifying && (
         <View style={styles.verifyingContainer}>
@@ -173,26 +365,126 @@ export default function QRScanner() {
         </View>
       )}
       
-      {scanned && !verifying && patientInfo && (
-        <View style={styles.resultContainer}>
-          <Text style={styles.resultTitle}>✅ Verified Patient</Text>
-          <Text style={styles.resultText}>Name: {patientInfo.fullName}</Text>
-          <Text style={styles.resultText}>DOB: {patientInfo.dob}</Text>
-          <Text style={styles.resultText}>Gender: {patientInfo.gender}</Text>
-          <Button 
-            title="Scan Another" 
-            onPress={() => {
-              setScanned(false);
-              setPatientInfo(null);
-            }} 
-          />
+      {/* Patient Confirmation Screen */}
+      {scanned && !verifying && patientInfo && !confirmed && (
+        <View style={styles.confirmationContainer}>
+          <Text style={styles.confirmTitle}>✅ Patient Verified</Text>
+          <View style={styles.patientCard}>
+            <Text style={styles.patientLabel}>Name:</Text>
+            <Text style={styles.patientValue}>{patientInfo.fullName}</Text>
+            
+            <Text style={styles.patientLabel}>Date of Birth:</Text>
+            <Text style={styles.patientValue}>{patientInfo.dob}</Text>
+            
+            <Text style={styles.patientLabel}>Gender:</Text>
+            <Text style={styles.patientValue}>{patientInfo.gender}</Text>
+          </View>
+          
+          <Text style={styles.confirmQuestion}>Is this the correct patient?</Text>
+          
+          <View style={styles.confirmButtons}>
+            <TouchableOpacity 
+              style={[styles.confirmButton, styles.cancelButton]} 
+              onPress={resetScanner}
+            >
+              <Text style={styles.buttonText}>❌ Cancel</Text>
+            </TouchableOpacity>
+            
+            <TouchableOpacity 
+              style={[styles.confirmButton, styles.confirmButtonGreen]} 
+              onPress={handleConfirmPatient}
+            >
+              <Text style={styles.buttonText}>✓ Confirm</Text>
+            </TouchableOpacity>
+          </View>
         </View>
       )}
       
-      {!scanned && !verifying && (
+      {/* Action Menu After Confirmation */}
+      {scanned && confirmed && patientInfo && mode === 'qr' && (
+        <View style={styles.actionContainer}>
+          <Text style={styles.actionTitle}>Patient: {patientInfo.fullName}</Text>
+          <Text style={styles.actionSubtitle}>Select an action:</Text>
+          
+          <TouchableOpacity 
+            style={[styles.actionButton, styles.photoButton]} 
+            onPress={handleTakePhoto}
+          >
+            <Text style={styles.actionButtonText}>📷 Take Photograph</Text>
+          </TouchableOpacity>
+          
+          <TouchableOpacity 
+            style={[styles.actionButton, styles.medicationButton]} 
+            onPress={handleScanMedication}
+          >
+            <Text style={styles.actionButtonText}>💊 Scan Medication</Text>
+          </TouchableOpacity>
+          
+          <TouchableOpacity 
+            style={[styles.actionButton, styles.backButton]} 
+            onPress={resetScanner}
+          >
+            <Text style={styles.actionButtonText}>⬅️ Scan Another Patient</Text>
+          </TouchableOpacity>
+        </View>
+      )}
+      
+      {/* Photo Capture Controls */}
+      {mode === 'photo' && !capturedPhoto && !uploading && (
+        <View style={styles.photoControlsContainer}>
+          <Text style={styles.photoTitle}>Take photo for {patientInfo?.fullName}</Text>
+          <View style={styles.photoButtons}>
+            <TouchableOpacity 
+              style={[styles.photoControlButton, styles.cancelPhotoButton]} 
+              onPress={() => setMode('qr')}
+            >
+              <Text style={styles.buttonText}>❌ Cancel</Text>
+            </TouchableOpacity>
+            
+            <TouchableOpacity 
+              style={[styles.photoControlButton, styles.captureButton]} 
+              onPress={capturePhoto}
+            >
+              <Text style={styles.buttonText}>📸 Capture</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      )}
+      
+      {/* Uploading Indicator */}
+      {uploading && (
+        <View style={styles.uploadingContainer}>
+          <ActivityIndicator size="large" color="#2196F3" />
+          <Text style={styles.uploadingText}>Uploading photo...</Text>
+        </View>
+      )}
+      
+      {/* Medication Scanning Mode */}
+      {mode === 'medication' && !uploading && (
+        <View style={styles.medicationScanContainer}>
+          <Text style={styles.medicationTitle}>Scan Medication Barcode</Text>
+          <Text style={styles.medicationSubtitle}>Patient: {patientInfo?.fullName}</Text>
+          <Text style={styles.medicationInstruction}>
+            Point camera at medication barcode
+          </Text>
+          <Text style={styles.medicationFormats}>
+            Supported: EAN-13, EAN-8, Code-128, Code-39, QR
+          </Text>
+          <TouchableOpacity 
+            style={[styles.photoControlButton, styles.cancelPhotoButton]}
+            onPress={() => setMode('qr')}
+          >
+            <Text style={styles.buttonText}>❌ Cancel</Text>
+          </TouchableOpacity>
+        </View>
+      )}
+      
+      {!scanned && !verifying && mode === 'qr' && (
         <View style={styles.instructionContainer}>
           <Text style={styles.instruction}>
-            Point your camera at a patient QR code to scan and verify
+            {mode === 'medication' 
+              ? 'Point camera at medication barcode'
+              : 'Point your camera at a patient QR code to scan and verify'}
           </Text>
         </View>
       )}
@@ -293,5 +585,203 @@ const styles = StyleSheet.create({
     fontSize: 16,
     marginBottom: 8,
     color: '#000',
+  },
+  confirmationContainer: {
+    position: 'absolute',
+    top: 120,
+    left: 20,
+    right: 20,
+    backgroundColor: 'rgba(255, 255, 255, 0.98)',
+    padding: 25,
+    borderRadius: 15,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.25,
+    shadowRadius: 3.84,
+    elevation: 5,
+  },
+  confirmTitle: {
+    fontSize: 24,
+    fontWeight: 'bold',
+    color: '#00aa00',
+    textAlign: 'center',
+    marginBottom: 20,
+  },
+  patientCard: {
+    backgroundColor: '#f5f5f5',
+    padding: 15,
+    borderRadius: 10,
+    marginBottom: 20,
+  },
+  patientLabel: {
+    fontSize: 14,
+    color: '#666',
+    marginTop: 10,
+    fontWeight: '600',
+  },
+  patientValue: {
+    fontSize: 18,
+    color: '#000',
+    marginTop: 5,
+    fontWeight: 'bold',
+  },
+  confirmQuestion: {
+    fontSize: 16,
+    color: '#333',
+    textAlign: 'center',
+    marginBottom: 20,
+    fontWeight: '600',
+  },
+  confirmButtons: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    gap: 10,
+  },
+  confirmButton: {
+    flex: 1,
+    padding: 15,
+    borderRadius: 10,
+    alignItems: 'center',
+  },
+  cancelButton: {
+    backgroundColor: '#ff4444',
+  },
+  confirmButtonGreen: {
+    backgroundColor: '#00aa00',
+  },
+  buttonText: {
+    color: '#fff',
+    fontSize: 16,
+    fontWeight: 'bold',
+  },
+  actionContainer: {
+    position: 'absolute',
+    bottom: 50,
+    left: 20,
+    right: 20,
+    backgroundColor: 'rgba(255, 255, 255, 0.98)',
+    padding: 25,
+    borderRadius: 15,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.25,
+    shadowRadius: 3.84,
+    elevation: 5,
+  },
+  actionTitle: {
+    fontSize: 20,
+    fontWeight: 'bold',
+    color: '#333',
+    textAlign: 'center',
+    marginBottom: 5,
+  },
+  actionSubtitle: {
+    fontSize: 14,
+    color: '#666',
+    textAlign: 'center',
+    marginBottom: 20,
+  },
+  actionButton: {
+    padding: 18,
+    borderRadius: 10,
+    marginBottom: 12,
+    alignItems: 'center',
+  },
+  photoButton: {
+    backgroundColor: '#2196F3',
+  },
+  medicationButton: {
+    backgroundColor: '#4CAF50',
+  },
+  backButton: {
+    backgroundColor: '#757575',
+  },
+  actionButtonText: {
+    color: '#fff',
+    fontSize: 18,
+    fontWeight: 'bold',
+  },
+  photoControlsContainer: {
+    position: 'absolute',
+    bottom: 50,
+    left: 20,
+    right: 20,
+    backgroundColor: 'rgba(0, 0, 0, 0.9)',
+    padding: 25,
+    borderRadius: 15,
+  },
+  photoTitle: {
+    fontSize: 18,
+    color: '#fff',
+    textAlign: 'center',
+    marginBottom: 20,
+    fontWeight: 'bold',
+  },
+  photoButtons: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    gap: 10,
+  },
+  photoControlButton: {
+    flex: 1,
+    padding: 15,
+    borderRadius: 10,
+    alignItems: 'center',
+  },
+  cancelPhotoButton: {
+    backgroundColor: '#ff4444',
+  },
+  captureButton: {
+    backgroundColor: '#2196F3',
+  },
+  uploadingContainer: {
+    position: 'absolute',
+    bottom: 50,
+    left: 20,
+    right: 20,
+    backgroundColor: 'rgba(33, 150, 243, 0.95)',
+    padding: 30,
+    borderRadius: 15,
+    alignItems: 'center',
+  },
+  uploadingText: {
+    fontSize: 18,
+    marginTop: 15,
+    color: '#fff',
+    fontWeight: 'bold',
+  },
+  medicationScanContainer: {
+    position: 'absolute',
+    bottom: 50,
+    left: 20,
+    right: 20,
+    backgroundColor: 'rgba(76, 175, 80, 0.95)',
+    padding: 25,
+    borderRadius: 15,
+    alignItems: 'center',
+  },
+  medicationTitle: {
+    fontSize: 22,
+    color: '#fff',
+    fontWeight: 'bold',
+    marginBottom: 10,
+  },
+  medicationSubtitle: {
+    fontSize: 16,
+    color: '#fff',
+    marginBottom: 15,
+  },
+  medicationInstruction: {
+    fontSize: 16,
+    color: '#fff',
+    textAlign: 'center',
+    marginBottom: 10,
+  },
+  medicationFormats: {
+    fontSize: 12,
+    color: '#e0e0e0',
+    textAlign: 'center',
+    marginBottom: 20,
+    fontStyle: 'italic',
   },
 });

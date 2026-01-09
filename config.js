@@ -6,15 +6,15 @@
 const ENVIRONMENT = 'local'; // Options: 'local', 'test', 'production'
 
 // Your local development IP (update this when needed)
-const LOCAL_IP = '192.168.0.41';
+const LOCAL_IP = '10.230.52.37';
 
 // ============ API URLs ============
 const API_URLS = {
-  // Local development (your computer)
-  local: `http://${LOCAL_IP}:5000/api`,
+  // Local development (your computer via ngrok)
+  local: 'https://jacques-azoic-tammy.ngrok-free.dev/api',
   
   // Test server
-  test: 'http://localhost:5000/api', // Update with your test server URL
+  test: 'https://172.187.170.17/api',
   
   // Production server
   production: 'https://nutissux.e-plaster.com/api'
